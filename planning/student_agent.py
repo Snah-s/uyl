@@ -11,25 +11,26 @@ class AssemblyAgent:
     dominio + UN ejemplo resuelto (en lenguaje natural) + el problema real cuyo
     ultimo bloque [PLAN] esta vacio.
 
-    Leccion de la corrida baseline (0.62/10, mystery)
-    -------------------------------------------------
-    El parseo ya es 100% fiable; lo que falla es el RAZONAMIENTO del modelo:
-      * En ~16/30 casos el plan arrancaba con `(overcome ...)` o `(succumb ...)`,
-        que son IMPOSIBLES desde el estado inicial (exigen `Pain`, y el estado
-        inicial tiene `Harmony` sin `Pain`). El optimo SIEMPRE empieza por
-        `attack` o `feast`. El modelo no chequeaba precondiciones.
-      * Planes demasiado largos (8 acciones vs 4 optimas) => perdia el +2 de
-        longitud del evaluador.
-    Causa raiz: el prompt anterior PROHIBIA razonar ("no expliques") y solo pedia
-    "imitar el estilo del ejemplo". Para un dominio ofuscado (Mystery-Blocksworld)
-    eso copia la forma sin simular el estado.
+    Historial de corridas (mystery, 30 casos de Examples.json)
+    ----------------------------------------------------------
+    * v1 (salida directa, "imita el ejemplo, no expliques"): 0.62/10, 124.7s.
+      Fallo dominante: ~16/30 planes arrancaban con `(overcome ...)`/`(succumb ...)`,
+      IMPOSIBLES desde el estado inicial (exigen `Pain`; el inicial tiene `Harmony`
+      sin `Pain`). El optimo SIEMPRE empieza por `attack` o `feast`.
+    * v2 (CoT con simulacion de estado + marcador `FINAL PLAN:`): 0.57/10, 2205s.
+      REGRESION. El razonamiento en el canal de respuesta se comporta como
+      thinking: explota el tiempo (73s/caso -> ~60 min sobre las 50 tareas) y
+      degenera a temp 0 (planes vacios por agotar tokens; bucles y acciones
+      duplicadas `[feast a b, feast a b, ...]`). PERO arreglo el idx-0: casi
+      ningun plan empieza ya con overcome/succumb.
 
-    Estrategia nueva
-    ----------------
-    Convertimos el system en un CoT con SIMULACION DE ESTADO y chequeo de
-    precondiciones, y le pedimos que emita el plan FINAL tras un marcador unico
-    (`FINAL PLAN:`). El parser ignora todo el razonamiento y extrae solo ese
-    bloque final, lo convierte a canonico y valida por aridad.
+    Estrategia v3 (esta)
+    --------------------
+    Nos quedamos con lo unico que ayudo (las reglas de precondicion como
+    RESTRICCIONES DURAS) y descartamos el razonamiento verboso: salida DIRECTA y
+    corta (como v1, ~4s/caso), `max_new_tokens` bajo para cortar bucles, y una red
+    de seguridad en el parser contra la duplicacion consecutiva (que en estos
+    dominios nunca es un plan valido).
 
     Dominios
     --------
@@ -37,42 +38,27 @@ class AssemblyAgent:
     - blocks          : engage_payload/release_payload (1), mount_node/unmount_node (2)
     """
 
-    # Marcador que separa el razonamiento del plan definitivo.
+    # Marcador opcional: si el modelo lo emitiese, el parser toma solo lo de despues.
     FINAL_MARKER = "final plan:"
 
     SYSTEM_PROMPT = (
-        "You are an expert automated planner for a STRIPS-style domain. You are "
-        "given the domain rules, ONE solved example, and a new problem whose final "
-        "[PLAN] is empty. Solve ONLY the final problem.\n"
+        "You are an expert STRIPS planner. The problem gives the domain rules, ONE "
+        "solved example, and a final problem whose last [PLAN] is empty. Output "
+        "ONLY the plan for the FINAL problem: one action per line, using the SAME "
+        "wording as the example, then a final line [PLAN END]. No explanations, no "
+        "numbering, no thinking, and never repeat an action twice in a row. Make "
+        "the plan as SHORT as possible and stop as soon as the goal holds.\n"
         "\n"
-        "Reason step by step BEFORE writing the plan:\n"
-        "1. Write down the initial facts and the goal facts of the FINAL problem.\n"
-        "2. Simulate the world. You may pick an action ONLY if its preconditions "
-        "are currently true. After each action, update the facts "
-        "(Province / Planet / Harmony / Pain / Craves) accordingly.\n"
-        "3. Choose the SHORTEST sequence that makes ALL goal facts true, and STOP "
-        "as soon as the goal holds. Do not add extra actions.\n"
-        "\n"
-        "Action rules (mystery domain):\n"
-        "- Attack X: needs Province X, Planet X, Harmony -> +Pain X; "
-        "-Province X, -Planet X, -Harmony.\n"
-        "- Succumb X: needs Pain X -> +Province X, +Planet X, +Harmony; -Pain X.\n"
-        "- Overcome X from Y: needs Province Y, Pain X -> +Harmony, +Province X, "
-        "+'X craves Y'; -Province Y, -Pain X.\n"
-        "- Feast X from Y: needs 'X craves Y', Province X, Harmony -> +Pain X, "
-        "+Province Y; -'X craves Y', -Province X, -Harmony.\n"
-        "KEY: a state that has Harmony but no Pain can NEVER start with Overcome or "
-        "Succumb; the first action is always Attack or Feast.\n"
-        "To make 'X craves Y' you need Overcome X from Y, which needs Pain X "
-        "(usually via Attack X first) and Province Y.\n"
-        "\n"
-        "When finished, output on its own line exactly:\n"
-        "FINAL PLAN:\n"
-        "then ONE action per line, using the SAME natural-language wording as the "
-        "example ('attack object a', 'overcome object a from object b', ...), and "
-        "close with a final line:\n"
-        "[PLAN END]\n"
-        "Do not number the actions and do not write anything after [PLAN END]."
+        "Respect these preconditions of the mystery domain:\n"
+        "- Attack X needs Province X + Planet X + Harmony (it produces Pain X).\n"
+        "- Succumb X needs Pain X. Overcome X from Y needs Pain X + Province Y.\n"
+        "- Feast X from Y needs 'X craves Y' + Province X + Harmony.\n"
+        "- The initial state has Harmony but NO Pain, so the FIRST action is ALWAYS "
+        "Attack or Feast, NEVER Overcome or Succumb.\n"
+        "- To make 'X craves Y', finish with 'overcome X from Y' (which needs "
+        "Pain X, so 'attack X' shortly before).\n"
+        "- If X already craves something you need to change, do 'feast X from ...' "
+        "first to clear it."
     )
 
     def __init__(self):
@@ -85,13 +71,13 @@ class AssemblyAgent:
         respuesta = llm_engine_func(
             prompt=scenario_context,
             system=self.system_prompt,
-            # Mas presupuesto: ahora hay razonamiento ademas del plan.
-            max_new_tokens=1024,
+            # Plan corto (<=6 acciones ~ 6 lineas). Un tope bajo mantiene ~4s/caso
+            # y CORTA los bucles degenerados que aparecian con 1024 tokens.
+            max_new_tokens=256,
             temperature=0.0,
             top_p=1.0,
             do_sample=False,
-            # enable_thinking=True daria mejor razonamiento pero puede violar el
-            # limite de 2 min en Colab; el CoT va en el canal de respuesta.
+            # thinking desactivado a proposito: dispara el tiempo (>2 min).
             enable_thinking=False,
         )
 
@@ -143,7 +129,10 @@ class AssemblyAgent:
                 break
 
             accion = self._linea_a_canonico(low, dominio)
-            if accion:
+            # Red de seguridad: en mystery/blocks una accion nunca es valida dos
+            # veces seguidas (su precondicion desaparece tras ejecutarla). Si el
+            # modelo degenera y la repite, colapsamos el duplicado consecutivo.
+            if accion and (not acciones or acciones[-1] != accion):
                 acciones.append(accion)
 
         return acciones
