@@ -49,7 +49,7 @@ class AssemblyAgent:
     # Marcador opcional: si el modelo lo emitiese, el parser toma solo lo de despues.
     FINAL_MARKER = "final plan:"
 
-    SYSTEM_PROMPT = (
+    SYSTEM_PROMPT_MYSTERY = (
         "You are an expert STRIPS planner. The problem gives the domain rules, ONE "
         "solved example, and a final problem whose last [PLAN] is empty. Output "
         "ONLY the plan for the FINAL problem: one action per line, using the SAME "
@@ -79,16 +79,50 @@ class AssemblyAgent:
         "(needs Pain X + Province Y)."
     )
 
+    SYSTEM_PROMPT_BLOCKS = (
+        "You are an expert blocksworld planner. The problem gives the domain rules, "
+        "ONE solved example, and a final problem whose last [PLAN] is empty. Output "
+        "ONLY the plan for the FINAL problem: one action per line, using EXACTLY the "
+        "same wording as the example ('pick up the red block', 'unmount_node the "
+        "blue block from on top of the red block', 'put down the blue block', "
+        "'mount_node the red block on top of the orange block'), then a final line "
+        "[PLAN END]. No explanations, no numbering, no thinking.\n"
+        "Constraints: the hand holds at most one block; you may pick up or "
+        "unmount_node a block only if your hand is empty and that block is "
+        "unobstructed (no block on top); to mount_node a block onto another you must "
+        "be holding it and the target block must be unobstructed; you may only pick "
+        "up a block that is on the table.\n"
+        "\n"
+        "Strategy (follow strictly):\n"
+        "1. First UNMOUNT_NODE every block that is on top of a wrong block and PUT "
+        "it DOWN, working from the topmost block downward, until every block you "
+        "need is free and on the table.\n"
+        "2. Then build each goal tower from the BOTTOM up: pick up the lower block, "
+        "mount_node the next block on top of it, and repeat upward.\n"
+        "3. Alternate correctly: after pick up / unmount_node your hand is FULL, so "
+        "the next action must be put down / mount_node; never pick up twice in a "
+        "row. Stop as soon as the goal stacking holds."
+    )
+
     def __init__(self):
-        self.system_prompt = self.SYSTEM_PROMPT
+        # Compatibilidad: expuesto pero solve() elige el prompt por dominio.
+        self.system_prompt = self.SYSTEM_PROMPT_MYSTERY
 
     # ------------------------------------------------------------------ #
     # API principal
     # ------------------------------------------------------------------ #
     def solve(self, scenario_context: str, llm_engine_func) -> list:
+        # El system depende del dominio: las reglas de mystery (Harmony/Province/
+        # craves) son ruido daniño para blocks, y viceversa.
+        dominio = self._detectar_dominio(scenario_context)
+        system = (
+            self.SYSTEM_PROMPT_BLOCKS if dominio == "blocks"
+            else self.SYSTEM_PROMPT_MYSTERY
+        )
+
         respuesta = llm_engine_func(
             prompt=scenario_context,
-            system=self.system_prompt,
+            system=system,
             # Plan corto (<=6 acciones ~ 6 lineas). Un tope bajo mantiene ~4s/caso
             # y CORTA los bucles degenerados que aparecian con 1024 tokens.
             max_new_tokens=256,
@@ -99,7 +133,6 @@ class AssemblyAgent:
             enable_thinking=False,
         )
 
-        dominio = self._detectar_dominio(scenario_context)
         return self._parsear_plan(respuesta, dominio)
 
     # ------------------------------------------------------------------ #
@@ -188,15 +221,17 @@ class AssemblyAgent:
     # ---- blocks ------------------------------------------------------- #
     @staticmethod
     def _blocks_natural(low: str):
-        # unmount_node ANTES que mount_node (uno es subcadena del otro).
+        # unmount_node/unstack ANTES que mount_node/stack (subcadenas entre si).
+        # Aceptamos el alias 'unstack'/'stack' por si el modelo copia la cabecera
+        # del dominio ("Stack a block ...") en vez del ejemplo ("mount_node ...").
         m = re.search(
-            r"unmount_node\s+the\s+(\w+)\s+block\s+from\s+on\s+top\s+of\s+the\s+(\w+)\s+block",
+            r"(?:unmount_node|unstack)\s+the\s+(\w+)\s+block\s+from\s+on\s+top\s+of\s+the\s+(\w+)\s+block",
             low,
         )
         if m:
             return f"(unmount_node {m.group(1)} {m.group(2)})"
         m = re.search(
-            r"mount_node\s+the\s+(\w+)\s+block\s+on\s+top\s+of\s+the\s+(\w+)\s+block",
+            r"(?:mount_node|stack)\s+the\s+(\w+)\s+block\s+on\s+top\s+of\s+the\s+(\w+)\s+block",
             low,
         )
         if m:
