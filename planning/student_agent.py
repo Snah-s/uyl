@@ -24,13 +24,21 @@ class AssemblyAgent:
       duplicadas `[feast a b, feast a b, ...]`). PERO arreglo el idx-0: casi
       ningun plan empieza ya con overcome/succumb.
 
-    Estrategia v3 (esta)
+    * v3 (salida directa + reglas de precondicion duras + dedup + 256 tokens):
+      **1.25/10, 111s**. Arreglado el tiempo (~3.7s/caso, bajo el limite) y el
+      score duplica a v1. Aparecen 2 aciertos perfectos (10/10). Nuevo fallo
+      dominante: en idx-1, tras un `feast` correcto, el modelo hace `overcome`
+      cuando el optimo hace `succumb`. Ademas mi instruccion "as SHORT as
+      possible" producia planes DEMASIADO cortos (perdian el +2 de longitud).
+
+    Estrategia v4 (esta)
     --------------------
-    Nos quedamos con lo unico que ayudo (las reglas de precondicion como
-    RESTRICCIONES DURAS) y descartamos el razonamiento verboso: salida DIRECTA y
-    corta (como v1, ~4s/caso), `max_new_tokens` bajo para cortar bucles, y una red
-    de seguridad en el parser contra la duplicacion consecutiva (que en estos
-    dominios nunca es un plan valido).
+    Regla de orden EXACTA para el idx-1: Attack y Feast CONSUMEN Harmony;
+    Overcome NO necesita Harmony. Por tanto, tras un feast/attack, si el siguiente
+    paso es otro attack/feast hay que `succumb` primero; si es overcome, no.
+    Ademas: apertura por craves (hay craves iniciales -> Feast; no hay -> Attack),
+    y se quita "as SHORT as possible" (pedia planes cortos de mas) por "alcanza la
+    meta completa; los planes suelen ser de 2, 4 o 6 acciones".
 
     Dominios
     --------
@@ -46,19 +54,29 @@ class AssemblyAgent:
         "solved example, and a final problem whose last [PLAN] is empty. Output "
         "ONLY the plan for the FINAL problem: one action per line, using the SAME "
         "wording as the example, then a final line [PLAN END]. No explanations, no "
-        "numbering, no thinking, and never repeat an action twice in a row. Make "
-        "the plan as SHORT as possible and stop as soon as the goal holds.\n"
+        "numbering, no thinking, and never repeat an action twice in a row.\n"
+        "Reach the COMPLETE goal (every required craving); do NOT stop early. "
+        "Optimal plans are usually 2, 4 or 6 actions long.\n"
         "\n"
-        "Respect these preconditions of the mystery domain:\n"
-        "- Attack X needs Province X + Planet X + Harmony (it produces Pain X).\n"
-        "- Succumb X needs Pain X. Overcome X from Y needs Pain X + Province Y.\n"
-        "- Feast X from Y needs 'X craves Y' + Province X + Harmony.\n"
-        "- The initial state has Harmony but NO Pain, so the FIRST action is ALWAYS "
-        "Attack or Feast, NEVER Overcome or Succumb.\n"
-        "- To make 'X craves Y', finish with 'overcome X from Y' (which needs "
-        "Pain X, so 'attack X' shortly before).\n"
-        "- If X already craves something you need to change, do 'feast X from ...' "
-        "first to clear it."
+        "Mystery actions and how they constrain the ORDER:\n"
+        "- Attack X needs Province X + Planet X + Harmony; produces Pain X and "
+        "REMOVES Harmony.\n"
+        "- Feast X from Y needs 'X craves Y' + Province X + Harmony; produces "
+        "Pain X + Province Y and REMOVES Harmony and the craving.\n"
+        "- Succumb X needs Pain X; restores Province X + Planet X + Harmony.\n"
+        "- Overcome X from Y needs Pain X + Province Y (it does NOT need Harmony); "
+        "produces 'X craves Y' + Province X + Harmony.\n"
+        "\n"
+        "Ordering rules (follow strictly):\n"
+        "1. FIRST action: if the initial conditions list any 'X craves Y', begin "
+        "with a Feast; if there are no cravings initially, begin with an Attack. "
+        "NEVER begin with Overcome or Succumb (there is no Pain yet).\n"
+        "2. Attack and Feast both CONSUME Harmony; Overcome does NOT need Harmony. "
+        "So right after an Attack or a Feast: if the next step is another Attack or "
+        "Feast, you MUST insert 'succumb' first to get Harmony back; if the next "
+        "step is an Overcome, do NOT succumb.\n"
+        "3. To create 'X craves Y', finish that part with 'overcome X from Y' "
+        "(needs Pain X + Province Y)."
     )
 
     def __init__(self):
