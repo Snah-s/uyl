@@ -40,6 +40,15 @@ class AssemblyAgent:
     y se quita "as SHORT as possible" (pedia planes cortos de mas) por "alcanza la
     meta completa; los planes suelen ser de 2, 4 o 6 acciones".
 
+    Estrategia v5 (esta)
+    --------------------
+    Sobre v4 se anade DETECCION DE CICLOS en el parser. Diagnostico sobre Task:
+    36/50 planes salian con longitud impar o >6 (el optimo SIEMPRE es 2, 4 o 6),
+    con casos de 8/10/12/16 acciones = el modelo repitiendo bloques de 2-3
+    acciones. El dedup consecutivo (v3) solo mata A A; ahora `_romper_ciclos`
+    corta A B A B / A B C A B C, recuperando esos planes degenerados sin tocar
+    los sanos.
+
     Dominios
     --------
     - mystery/objects : attack/succumb (1 arg), feast/overcome (2 args)
@@ -186,7 +195,30 @@ class AssemblyAgent:
             if accion and (not acciones or acciones[-1] != accion):
                 acciones.append(accion)
 
-        return acciones
+        # Segunda red: cortar BUCLES (no solo duplicados consecutivos). En Task
+        # el modelo degenera en Ciclos de 2-3 acciones que se repiten
+        # (planes de 8/10/12/16 acciones, imposibles: el optimo es 2, 4 o 6).
+        return self._romper_ciclos(acciones)
+
+    @staticmethod
+    def _romper_ciclos(acciones: list) -> list:
+        """Trunca en cuanto el plan empieza a repetir un bloque de 1-3 acciones.
+
+        En mystery/blocks la precondicion de una accion desaparece al ejecutarla,
+        asi que un bloque adyacente repetido (A B A B, A B C A B C, ...) es SIEMPRE
+        degeneracion del modelo, no plan valido. Al detectar el primer ciclo
+        conservamos una sola copia del bloque y descartamos toda la cola posterior
+        (que ya es basura). No toca planes sanos (<=6 acciones sin repeticion).
+        """
+        out = []
+        for a in acciones:
+            out.append(a)
+            n = len(out)
+            for k in (1, 2, 3):
+                if n >= 2 * k and out[-2 * k:-k] == out[-k:]:
+                    del out[-k:]      # quita la repeticion; corta el bucle aqui
+                    return out
+        return out
 
     def _linea_a_canonico(self, low: str, dominio: str):
         # 1) Si el modelo ya escribio formato canonico, lo reutilizamos.
